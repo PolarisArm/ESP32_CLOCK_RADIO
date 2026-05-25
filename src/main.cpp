@@ -1,24 +1,33 @@
+#include <WiFi.h>
 #include <lvgl.h>
 #include <TFT_eSPI.h>
 #include <Arduino.h>
 #include <string.h>
-#include "Squareline/ui.h"
-#include "esp_heap_caps.h"
 #include <LittleFS.h>
+#include <WiFi.h>
 #include <Wire.h>
+#include "esp_heap_caps.h"
+#include "BMP280.h"
+#include "Squareline/ui.h"
 #include "Clock.h"
 #include "Alarm.h"
 
-#define LEFT 33
-#define RIGHT 25
+#include "driver/i2s.h"
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_ONLY_MP3
+#define MINIMP3_NO_STDIO
+#include "minimp3.h"
 
-#define ENTER 26  // ADD THIS - you need a 3rd button for clicking
+
+#define I2S_LRC  14
+#define I2S_DOUT 26
+#define I2S_BCLK 27
+
 #define ADC 34
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 #define DRAW_BUFSIZE ((SCREEN_HEIGHT * SCREEN_WIDTH) / 10)
 #define FORMAT_LITTLEFS_IF_FAILED true
-
 
 
 uint8_t SEC = 0;
@@ -42,16 +51,30 @@ static char Secsbuf[4];
 static char tempBuf[8];
 
 
-
 TFT_eSPI tft = TFT_eSPI(SCREEN_HEIGHT,SCREEN_WIDTH);
 uint16_t calData[5] = { 364, 3452, 302, 3423, 7 };
-
+//uint16_t calData[5] = { 332, 3510, 312, 3295, 7 };
 lv_obj_t* alarmContainerLabelArr[5];
 uint8_t alarmLabel = 0;
 
 Clock clk = Clock();
 RTC_CLOCK rtc;
 Alarm alarmClock;
+BMP280 bmp;
+
+String ssid;
+String pass;
+
+TaskHandle_t GuiTask;
+TaskHandle_t WifiTask;
+TaskHandle_t BmpTask;
+TaskHandle_t WifiConnectTask;
+
+volatile bool wifiTaskStarted = false;
+volatile bool stopWifiScan = false;
+
+QueueHandle_t wifiQueue;
+SemaphoreHandle_t i2cMutex = NULL;
 
 // Function Prototypes
 void log_print(lv_log_level_t level, const char* buf);
@@ -59,69 +82,19 @@ void my_disp_flush (lv_display_t *disp, const lv_area_t *area, uint8_t *pixelmap
 void my_touchpad_read(lv_indev_t * indev, lv_indev_data_t * data);
 
 static void event_handler(lv_event_t* e);
+static void WifiDropDownEvent(lv_event_t* event);
+static void passwordTextAreaEvent(lv_event_t* event);
+static void passwordKeyboardEvent(lv_event_t* event);
+
 static void clock_cb(lv_timer_t* timer);
+static void timer_cb(lv_timer_t* timer);
+static void delete_label_event_handler(lv_event_t *e);
+lv_obj_t* AddLabel(const char* name);
 
-
-static void timer_cb(lv_timer_t* timer){
-
-    static int angle = 0;
-
-    if(angle > 100){angle = 0;}
-
-    if(ui_mainScreen){
-            
-            lv_label_set_text_fmt(ui_tempLabel,"%d°C",angle);
-            lv_arc_set_value(ui_tempArc,angle);
-
-        }
-   
-
-    angle++;
-}
-
-
-static void delete_label_event_handler(lv_event_t *e){
-    lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
-    int alarm_to_kill = (int)(intptr_t)lv_obj_get_user_data(obj);
-    alarmClock.removeAlarmClock(alarm_to_kill);
-
-    lv_obj_del_async(obj);
-
-    if(alarmLabel > 0){
-        alarmLabel--;
-        Serial.println("Alarm Label removed");
-    }
-}
-
-
-lv_obj_t* AddLabel(const char* name){
-
-    lv_obj_t* label = lv_label_create(ui_alarmContainer);
-
-    lv_obj_set_width(label, 80);
-    lv_obj_set_height(label, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(label, -73);
-    lv_obj_set_y(label, 1);
-    lv_obj_set_align(label, LV_ALIGN_CENTER);
-    lv_label_set_text(label, name);
-    lv_obj_set_style_text_color(label, lv_color_hex(0x446F00), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(label, lv_color_hex(0xF7F5F5), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_left(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_right(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_top(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_bottom(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    lv_obj_add_flag(label,LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(label,delete_label_event_handler,LV_EVENT_CLICKED,NULL);
-
-
-    return label;
-
-}
+void scanWifiTask(void *pvParameters);
+void lvgl_task(void *pvParmeter);
+void bmp_task(void* pvParameter);
+void connectWifiTask(void* pvParameter);
 
 
 
@@ -132,6 +105,31 @@ void setup() {
     analogReadResolution(12);
     randomSeed(analogRead(ADC));
 
+    if(!bmp.begin()){
+        Serial.println("bmp begin failed");
+    }
+    bmp.setOversampling(4);
+
+
+    wifiQueue = xQueueCreate(20,64);
+    i2cMutex = xSemaphoreCreateMutex();
+
+    if(i2cMutex == NULL){ Serial.println("Mutex Creation Failed");}
+
+    xTaskCreate(lvgl_task,"Gui Task",8192,NULL,2,&GuiTask);
+    xTaskCreate(bmp_task,"BMP Task",2048,NULL,0,&BmpTask);
+
+    
+}
+
+
+
+
+void loop() {}
+
+
+
+void lvgl_task(void *pvParmeter){
     tft.begin();
     tft.initDMA(); // MUST initialize DMA
     tft.setRotation(1);
@@ -150,6 +148,8 @@ void setup() {
     lv_indev_set_read_cb(indev, my_touchpad_read);
     lv_indev_set_display(indev, disp);
     ui_init();
+    lv_obj_add_flag(ui_InputContainer,LV_OBJ_FLAG_HIDDEN);
+
 
     lv_obj_add_event_cb(ui_hourroller,event_handler,LV_EVENT_VALUE_CHANGED,NULL);
     lv_obj_add_event_cb(ui_minroller,event_handler,LV_EVENT_VALUE_CHANGED,NULL);
@@ -160,6 +160,13 @@ void setup() {
     lv_obj_add_event_cb(ui_DateTimeOkBtn,event_handler,LV_EVENT_CLICKED,NULL);
     lv_obj_add_event_cb(ui_alarmSet,event_handler,LV_EVENT_CLICKED,NULL);
     lv_obj_add_event_cb(ui_alarmReset,event_handler,LV_EVENT_CLICKED,NULL);
+    lv_obj_add_event_cb(ui_ScanWifi,event_handler,LV_EVENT_CLICKED,NULL);
+    lv_obj_add_event_cb(ui_CancelWifiBtn,event_handler,LV_EVENT_CLICKED,NULL);
+    lv_obj_add_event_cb(ui_OKWifiBtn,event_handler,LV_EVENT_CLICKED,NULL);
+
+    lv_obj_add_event_cb(ui_WifiDropDown,WifiDropDownEvent,LV_EVENT_VALUE_CHANGED,NULL);
+    lv_obj_add_event_cb(ui_passwordTextArea,passwordTextAreaEvent,LV_EVENT_FOCUSED,NULL);
+    lv_obj_add_event_cb(ui_passwordKeyboard,passwordKeyboardEvent,LV_EVENT_ALL,NULL);
 
     timer = lv_timer_create(timer_cb, 1000, NULL);
     clock_timer = lv_timer_create(clock_cb, 1000, NULL);
@@ -179,24 +186,66 @@ void setup() {
     lv_obj_set_style_border_color(calendar_btnm, lv_palette_main(LV_PALETTE_GREEN), LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_width(calendar_btnm, 2, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_text_color(calendar_btnm, lv_color_hex(0x888888), LV_PART_ITEMS | LV_STATE_DISABLED);
-   // initializeClock();
-    Serial.println("Setup complete!");
-}
+    Serial.println("lvgl setup complete!");
+    lv_dropdown_clear_options(ui_WifiDropDown);
 
 
-void loop() {
-    
+    while(true){
 
-    
-   
-    static uint32_t last_tick = millis();
-    if(millis() - last_tick > 5) {
-        lv_tick_inc(millis() - last_tick);
-        last_tick = millis();
+        char recivedSSID[64];
+
+        if(xQueueReceive(wifiQueue,recivedSSID,0) == pdTRUE){
+            lv_dropdown_add_option(ui_WifiDropDown,recivedSSID,LV_DROPDOWN_POS_LAST);
+        }
+
+        static uint32_t last_tick = millis();
+        uint32_t now = millis();
+
+        if(now - last_tick > 0){
+        lv_tick_inc(now - last_tick);
+        last_tick = now;
+        }
+        
         lv_timer_handler();
+        vTaskDelay(5/portTICK_PERIOD_MS);
+        
     }
+
 }
 
+
+void bmp_task(void *pvParameter){
+    Serial.println("bmp Task");
+
+    while(true){
+        double T,P;
+        char result;
+        if(i2cMutex != NULL){
+            if(xSemaphoreTake(i2cMutex,pdMS_TO_TICKS(50)) == pdTRUE){
+                result = bmp.startMeasurment();
+                xSemaphoreGive(i2cMutex);
+
+                if(result!=0){
+                    vTaskDelay(result/portTICK_PERIOD_MS);
+                    if(xSemaphoreTake(i2cMutex,pdMS_TO_TICKS(50)) == pdTRUE){
+                        result = bmp.getTemperatureAndPressure(T,P);
+                        xSemaphoreGive(i2cMutex);
+                         Serial.print("T = \t");Serial.print(T,2); Serial.print(" degC\t");
+                         Serial.print("P = \t");Serial.print(P,2); Serial.print(" mBar\t");
+                         Serial.println();
+                    }else{
+                        Serial.println("BMP ERROR");
+                    }
+
+                   // vTaskDelay(50/portTICK_PERIOD_MS);
+                   
+                }
+            }
+        }
+        vTaskDelay(2000/portTICK_PERIOD_MS);
+    }
+
+}
 
 void log_print(lv_log_level_t level, const char* buf){
     Serial.println(buf);
@@ -224,6 +273,62 @@ void my_touchpad_read(lv_indev_t * indev, lv_indev_data_t * data)
     }
 }
 
+static void timer_cb(lv_timer_t* timer){
+
+    static int angle = 0;
+
+    if(angle > 100){angle = 0;}
+
+    if(ui_mainScreen){
+            
+        lv_label_set_text_fmt(ui_tempLabel,"%d°C",angle);
+        lv_arc_set_value(ui_tempArc,angle);
+
+    }
+   
+    angle++;
+}
+
+static void delete_label_event_handler(lv_event_t *e){
+    lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
+    int alarm_to_kill = (int)(intptr_t)lv_obj_get_user_data(obj);
+    alarmClock.removeAlarmClock(alarm_to_kill);
+
+    lv_obj_del_async(obj);
+
+    if(alarmLabel > 0){
+        alarmLabel--;
+        Serial.println("Alarm Label removed");
+    }
+}
+
+lv_obj_t* AddLabel(const char* name){
+
+    lv_obj_t* label = lv_label_create(ui_alarmContainer);
+
+    lv_obj_set_width(label, 80);
+    lv_obj_set_height(label, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(label, -73);
+    lv_obj_set_y(label, 1);
+    lv_obj_set_align(label, LV_ALIGN_CENTER);
+    lv_label_set_text(label, name);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x446F00), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(label, lv_color_hex(0xF7F5F5), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(label, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    lv_obj_add_flag(label,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(label,delete_label_event_handler,LV_EVENT_CLICKED,NULL);
+
+    return label;
+
+}
 
 static void event_handler(lv_event_t* e){
     lv_event_code_t code = lv_event_get_code(e);
@@ -260,6 +365,8 @@ static void event_handler(lv_event_t* e){
             lv_roller_get_selected_str(obj,buf,sizeof(buf));
             LV_LOG_USER("Selected Data roller 6: %s \n",buf);
         }
+
+       
 
        
     }
@@ -361,18 +468,104 @@ static void event_handler(lv_event_t* e){
 
             alarmLabel = 0;
         }
+
+        if(obj == ui_ScanWifi){
+            Serial.println("Scanning ..");
+            if(wifiTaskStarted == false){
+                lv_dropdown_clear_options(ui_WifiDropDown);
+                lv_label_set_text_fmt(ui_wifiButtonLabel,"%s","Stop");
+                xTaskCreate(scanWifiTask,"scanWifiTask",4096,NULL,1,&WifiTask);
+                stopWifiScan = false;
+                wifiTaskStarted = true;
+            }else{
+                lv_label_set_text_fmt(ui_wifiButtonLabel,"%s","Scan");
+                wifiTaskStarted = false;
+                stopWifiScan = true;
+
+            }
+        }
+        
+        if(obj == ui_CancelWifiBtn){
+            lv_obj_add_flag(ui_InputContainer,LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(ui_passwordKeyboard,LV_OBJ_FLAG_HIDDEN);
+            lv_textarea_set_text(ui_passwordTextArea, "");
+
+
+        }
+        if(obj == ui_OKWifiBtn){
+              pass = String(lv_textarea_get_text(ui_passwordTextArea));
+              pass.trim();
+              Serial.println(pass);
+              lv_obj_add_flag(ui_InputContainer,LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(ui_passwordKeyboard,LV_OBJ_FLAG_HIDDEN);
+              lv_textarea_set_text(ui_passwordTextArea, "");
+            
+              xTaskCreate(connectWifiTask,"CONNECT WIFI TASK",4096,NULL,2,&WifiConnectTask);
+
+        }
+    
     }
+
+
 
 }
 
-int al = 0;
+static void WifiDropDownEvent(lv_event_t* event){
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t* obj = lv_event_get_target_obj(event);
+     if(code == LV_EVENT_VALUE_CHANGED){
+      
+            char buf[32];
+            lv_dropdown_get_selected_str(obj,buf,sizeof(buf));
+            ssid = String(buf);
+            for(int i = 0; i < ssid.length() - 1; i++){
+                if(ssid.substring(i,i+2) == " ("){
+                    ssid = ssid.substring(0,i);
+                    break;
+                }
+            }
+            LV_LOG_USER("Selected wifi: %s\n",ssid);
+            lv_obj_remove_flag(ui_InputContainer,LV_OBJ_FLAG_HIDDEN);
+        }
+
+}
+
+static void passwordTextAreaEvent(lv_event_t* event){
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t* obj = lv_event_get_target_obj(event);
+    
+    if(code == LV_EVENT_FOCUSED){
+        lv_obj_remove_flag(ui_passwordKeyboard,LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void passwordKeyboardEvent(lv_event_t* event){
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t* obj = lv_event_get_target_obj(event);
+
+    if(code == LV_EVENT_READY){
+        lv_obj_add_flag(ui_passwordKeyboard,LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if(code == LV_EVENT_CANCEL ){
+        lv_obj_add_flag(ui_passwordKeyboard,LV_OBJ_FLAG_HIDDEN);
+
+    }
+}
+
+int al = -1;
+
 
 static void clock_cb(lv_timer_t* timer){
-    
+    if(i2cMutex == NULL) {return;}
     static int lastAMPMchange = -1;
     static int lastDatechange = -1;
-       
-    clk.read(rtc);
+    if(xSemaphoreTake(i2cMutex,pdMS_TO_TICKS(50)) == pdTRUE){
+                
+        clk.read(rtc);
+        xSemaphoreGive(i2cMutex);
+    }    
+    
     int alarmCheck = alarmClock.checkAlarmClock(rtc);
 
     if(alarmCheck >= 0){al = 3;}
@@ -413,13 +606,74 @@ static void clock_cb(lv_timer_t* timer){
             lastDatechange = rtc.date;
         }
         
-
     }  
 
-    
+   
 }
 
 
+void scanWifiTask(void *pvParameters){
+    vTaskDelay(1000);
+
+    WiFi.mode(WIFI_STA);
+
+    while(true){
+        //lv_label_set_text_fmt(ui_wifiStatusBar,"%s","Scanning...");
+
+        int n = WiFi.scanNetworks();
+
+        if(n > 0){
+            //lv_dropdown_clear_options(ui_WifiDropDown);
+            vTaskDelay(10);
+
+            for(int i = 0; i < n; i++){
+                char item[64];
+                snprintf(item,sizeof(item),"%s (%d)", WiFi.SSID(i).c_str(),WiFi.RSSI(i));
+                xQueueSend(wifiQueue,item,portMAX_DELAY);
+               // lv_dropdown_add_option(ui_WifiDropDown,item.c_str(),LV_DROPDOWN_POS_LAST);
+                vTaskDelay(10);
+
+            }
+
+            break;
+
+            //lv_label_set_text_fmt(ui_wifiStatusBar,"%s","Network found :)");
+
+        }
+        vTaskDelay(100);
+    }
+    vTaskDelete(NULL);
+}
+
+
+void connectWifiTask(void* pvParameters){
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if(WiFi.isConnected()){WiFi.disconnect(true);};
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(),pass.c_str());
+    Serial.println("[WiFi] Connecting to Wifi..");
+
+    const TickType_t timeout = pdMS_TO_TICKS(15000);
+    TickType_t startTime = xTaskGetTickCount();
+
+    while(WiFi.status() != WL_CONNECTED){
+        if(xTaskGetTickCount() - startTime >= timeout){
+            Serial.printf("\n[WiFi] Connection timeout ");
+
+            vTaskDelete(NULL);
+            return;
+        }
+        Serial.print('.');
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    Serial.printf("[WiFi] Connected. IP: %s \n",WiFi.localIP().toString().c_str());
+
+    vTaskDelete(NULL);
+    
+    
+}
 
 void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixelmap) {
     uint32_t w = (area->x2 - area->x1 + 1);
@@ -432,6 +686,7 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *pixelmap)
     tft.setAddrWindow(area->x1, area->y1, w, h);
     // Use DMA to push colors - returns instantly while transfer happens in background
     tft.pushPixelsDMA((uint16_t*)pixelmap, w * h);
+    //tft.dmaWait();
     tft.endWrite();
 
     lv_disp_flush_ready(disp);

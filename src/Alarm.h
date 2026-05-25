@@ -7,10 +7,10 @@
 #define MAX_ALARMS 5
 
 struct AlarmEntry{
-        uint8_t hour;
-        uint8_t min;
-        uint8_t sec;
-        uint8_t amorpm;
+        uint8_t hour = 0;
+        uint8_t min = 0;
+        uint8_t sec = 0;
+        uint8_t amorpm = 0;
         bool lastMatch = false;
         bool active = false;
 };

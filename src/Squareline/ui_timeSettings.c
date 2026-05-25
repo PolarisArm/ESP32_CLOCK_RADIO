@@ -299,7 +299,7 @@ void ui_timeSettings_screen_init(void)
 
     ui_dateroller = lv_roller_create(ui_DateContainer);
     lv_roller_set_options(ui_dateroller,
-                          "1\n2\n3\n4\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n",
+                          "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n",
                           LV_ROLLER_MODE_NORMAL);
     lv_obj_set_width(ui_dateroller, 50);
     lv_obj_set_height(ui_dateroller, 90);

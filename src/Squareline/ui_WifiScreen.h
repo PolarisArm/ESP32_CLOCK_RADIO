@@ -19,11 +19,26 @@ extern lv_obj_t * ui_backFromWifiToMenu;
 extern lv_obj_t * ui_Container3;
 extern lv_obj_t * ui_WifiDropDown;
 extern lv_obj_t * ui_ScanWifi;
+extern lv_obj_t * ui_wifiButtonLabel;
+extern lv_obj_t * ui_InputContainer;
+extern lv_obj_t * ui_passwordTextArea;
+extern lv_obj_t * ui_passwordContainer;
+extern lv_obj_t * ui_CancelWifiBtn;
+extern lv_obj_t * ui_Label14;
+extern lv_obj_t * ui_OKWifiBtn;
 extern lv_obj_t * ui_Label13;
+extern lv_obj_t * ui_passwordKeyboard;
 // CUSTOM VARIABLES
 extern lv_obj_t * uic_WifiScreen;
 extern lv_obj_t * uic_backFromWifiToMenu;
 extern lv_obj_t * uic_WifiDropDown;
+extern lv_obj_t * uic_wifiButtonLabel;
+extern lv_obj_t * uic_InputContainer;
+extern lv_obj_t * uic_passwordTextArea;
+extern lv_obj_t * uic_passwordContainer;
+extern lv_obj_t * uic_CancelWifiBtn;
+extern lv_obj_t * uic_OKWifiBtn;
+extern lv_obj_t * uic_passwordKeyboard;
 
 #ifdef __cplusplus
 } /*extern "C"*/
